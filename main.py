@@ -4,6 +4,7 @@ from model.semseg.deeplabv3plus import DeepLabV3Plus
 from model.semseg.pspnet import PSPNet
 from utils import count_params, meanIOU, color_map
 
+#Test_new测试版本
 import argparse
 from copy import deepcopy
 import numpy as np
