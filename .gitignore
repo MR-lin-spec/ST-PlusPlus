@@ -3,7 +3,7 @@
 /dataset/splits/*.tar.gz*
 /dataset/splits/VOC2012/*
 /dataset/splits/*
-
+/runs/*
 #忽略pth模型文件，注意，注释和使用分别一行
 *.pth 
 *.log
