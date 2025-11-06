@@ -39,9 +39,11 @@ try:
     from model.rl.dynamic_threshold import DynamicThreshold
     from model.rl.RLmodel import PixelSACAgent, RLEntropyHighLoss
     from model.rl.utilss import compute_entropy_map
+    from model.rl.dynamic_threshold import DynamicThreshold
     RL_AVAILABLE = True
 except ImportError:
     RL_AVAILABLE = False
+
 
 
 # =================  全局变量  =================
@@ -387,6 +389,7 @@ def select_reliable(models, dataloader, args, logger):
 
 # =================  主流程  =================
 def main(args):
+    print(f"RL available: {RL_AVAILABLE}")
     logger, tb_writer = init_logger_and_tb()
     logger.info(f'训练配置 → {args}')
 
