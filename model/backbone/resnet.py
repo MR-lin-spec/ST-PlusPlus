@@ -1,9 +1,15 @@
 import torch
 import torch.nn as nn
-
+from torch.hub import load_state_dict_from_url  # 添加这一行
 
 __all__ = ['ResNet', 'resnet18', 'resnet34', 'resnet50', 'resnet101', 'resnet152']
-
+model_urls = {
+        'resnet18': 'https://download.pytorch.org/models/resnet18-f37072fd.pth',
+        'resnet34': 'https://download.pytorch.org/models/resnet34-b627a593.pth',
+        'resnet50': 'https://download.pytorch.org/models/resnet50-0676ba61.pth',
+        'resnet101': '/DeepLearning_linux/Projects/ST-PlusPlus/pretrained/resnet101.pth',
+        'resnet152': 'https://download.pytorch.org/models/resnet152-394f9c45.pth',
+    }
 
 def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
     return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
@@ -182,13 +188,26 @@ class ResNet(nn.Module):
         return c1, c2, c3, c4
 
 
+# 修改 resnet.py 中的 _resnet 函数
 def _resnet(arch, block, layers, pretrained, **kwargs):
     model = ResNet(block, layers, **kwargs)
     if pretrained:
-        state_dict = torch.load("pretrained/%s.pth" % arch)
-        model.load_state_dict(state_dict, strict=False)
+        # 检查是否是本地文件路径
+        if model_urls[arch].startswith('/'):  # 本地文件路径
+            state_dict = torch.load(model_urls[arch], map_location='cpu')
+        else:  # URL
+            state_dict = load_state_dict_from_url(model_urls[arch],
+                                                  progress=True)
+        # 获取当前模型的状态字典
+        model_state = model.state_dict()
+        # 只保留形状相同的键值对
+        filtered_state_dict = {
+            key: value for key, value in state_dict.items()
+            if key in model_state and model_state[key].shape == value.shape
+        }
+        model_state.update(filtered_state_dict)
+        model.load_state_dict(model_state, strict=False)
     return model
-
 
 def resnet18(pretrained=False):
     return _resnet('resnet18', BasicBlock, [2, 2, 2, 2], pretrained)
