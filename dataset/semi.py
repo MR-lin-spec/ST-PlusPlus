@@ -149,12 +149,19 @@ class SemiDataset(Dataset):
         img, mask = hflip(img, mask, p=0.5)                   # 随机水平翻转
 
         # 3. 强增强（仅无标签数据）
+        # 在 semi.py 文件中找到调用 cutout 的部分，修改为：
+        # 3. 强增强（仅无标签数据）
         if self.mode == 'semi_train' and id_ in self.unlabeled_ids:
             if random.random() < 0.8:
                 img = transforms.ColorJitter(0.5, 0.5, 0.5, 0.25)(img)
             img = transforms.RandomGrayscale(p=0.2)(img)
             img = blur(img, p=0.5)
-            img, mask = cutout(img, mask, p=0.5)
+            # 安全调用 cutout
+            try:
+                img, mask = cutout(img, mask, p=0.5)
+            except ValueError:
+                # 如果 cutout 失败（如擦除区域大于图像），则跳过此增强
+                pass
 
         # 4. 归一化
         img, mask = normalize(img, mask)

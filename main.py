@@ -211,7 +211,15 @@ def train(model, trainloader, valloader, criterion, optimizer, args, logger, tb_
 
             GLOBAL_ITERS += 1
             epoch_loss += base_loss.item()
+            # 更稳健的学习率计算
+            lr_factor = max(0.0, 1 - GLOBAL_ITERS / total_iters)
+            # 防止出现非常小的数值问题
+            lr_factor = max(lr_factor, 1e-8)
             lr = args.lr * (1 - GLOBAL_ITERS / total_iters) ** 0.9
+            # 添加类型检查确保 lr 是实数
+            if isinstance(lr, complex):
+                lr = lr.real
+   
             optimizer.param_groups[0]['lr'] = lr
             optimizer.param_groups[1]['lr'] = lr * 10 \
                 if args.model != 'deeplabv2' else lr
@@ -289,6 +297,7 @@ def label_past(model, dataloader, args, logger):
     logger.info(f'伪标签完成  mIOU={metric.evaluate()[-1]*100:.2f}%')
 
 
+# =================  伪标签生成  =================
 def label(model, dataloader, args, logger):
     model.eval()
     metric = meanIOU(num_classes=21 if args.dataset == 'pascal' else 19)
@@ -313,10 +322,12 @@ def label(model, dataloader, args, logger):
                 fname = f'{id[0]}.png'
             else:  # cityscapes
                 fname = f'{id[0]}_gtFine_labelIds.png'
-                
-        Image.fromarray(pred.squeeze(0).numpy().astype(np.uint8), mode='P') \
-            .putpalette(cmap) \
-            .save(os.path.join(args.pseudo_mask_path, fname))
+        
+        # 创建图像并保存
+        pred_array = pred.squeeze(0).numpy().astype(np.uint8)
+        pil_image = Image.fromarray(pred_array, mode='P')
+        pil_image.putpalette(cmap)
+        pil_image.save(os.path.join(args.pseudo_mask_path, fname))
 
     logger.info(f'伪标签完成  mIOU={metric.evaluate()[-1]*100:.2f}%')
 
