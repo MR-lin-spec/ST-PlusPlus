@@ -50,7 +50,7 @@ def parse_args():
                         help='初始学习率，None 则按数据集默认')
     parser.add_argument('--epochs', type=int, default=None,
                         help='总 epoch，None 则按数据集默认')
-    parser.add_argument('--crop-size', type=int, default=None)
+    parser.add_argument('--crop-size', type=int, default=224)
     parser.add_argument('--backbone', type=str,
                         choices=['resnet50', 'resnet101'], default='resnet50')
     parser.add_argument('--model', type=str,
