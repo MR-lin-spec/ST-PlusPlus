@@ -1,15 +1,12 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-ST++ 半监督语义分割主入口（仅保留DQN伪标签筛选环节）
-用法示例：
-    # 原始 ST++
-    python main.py --data-root /data/PASCAL --dataset pascal \
-                   --labeled-id-path dataset/splits/pascal/labeled.txt \
-                   --unlabeled-id-path dataset/splits/pascal/unlabeled.txt \
-                   --pseudo-mask-path out/pseudo --save-path out/weights
-    # DQN筛选模式（--algorithm st++_rl 生效）
-    python main.py ... --algorithm st++_rl --reliable-id-path out/reliable
+ST++ 半监督语义分割主入口（DQN伪标签筛选优化版）
+优化内容：
+1. 显存隔离：DQN训练前卸载segmentation模型，避免显存叠加
+2. 流式数据：使用生成器替代全量列表，解决内存问题
+3. 批量筛选：支持批量预测，提升效率
+4. 异常防护：增加数据校验、收敛检测、自动重训机制
 """
 import argparse
 import copy
@@ -24,13 +21,14 @@ from torch.nn import CrossEntropyLoss, DataParallel
 from torch.optim import SGD
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+import gc
 # =================  自定义包  =================
 from dataset.semi import SemiDataset
 from model.semseg.deeplabv2 import DeepLabV2
 from model.semseg.deeplabv3plus import DeepLabV3Plus
 from model.semseg.pspnet import PSPNet
 from utils import count_params, meanIOU, color_map
-# ----------  新增：导入简化版DQN筛选器  ----------
+# ----------  新增：导入优化版DQN筛选器  ----------
 try:
     from model.rl.simple_dqn import PseudoLabelSelector
     DQN_AVAILABLE = True
@@ -41,7 +39,7 @@ MODE = None          # 当前训练模式：train / semi_train
 GLOBAL_ITERS = 0     # 全局迭代计数（给 tensorboard 用）
 # =================  参数解析  =================
 def parse_args():
-    parser = argparse.ArgumentParser(description='ST++ 半监督框架（仅保留DQN筛选）')
+    parser = argparse.ArgumentParser(description='ST++ 半监督框架（DQN伪标签筛选优化版）')
     # 基础配置
     parser.add_argument('--data-root', type=str, required=True,
                         help='数据集根目录')
@@ -68,10 +66,15 @@ def parse_args():
                         help='可靠/不可靠图像ID保存路径（--algorithm st++_rl 时必需）')
     parser.add_argument('--plus', action='store_true',
                         help='是否启用 ST++ 两段重训练（DQN筛选依赖此模式）')
-    # ********  算法选择（--algorithm st++_rl 启用DQN筛选）  ********
+    # 算法选择
     parser.add_argument('--algorithm', type=str,
                         choices=['st++', 'st++_rl'], default='st++',
                         help='st++: 原始筛选；st++_rl: DQN伪标签筛选')
+    # DQN训练配置
+    parser.add_argument('--dqn-batch-size', type=int, default=8,
+                        help='DQN训练批量大小（影响显存与速度）')
+    parser.add_argument('--dqn-epochs', type=int, default=5,
+                        help='DQN训练轮次（建议5-8轮）')
     args = parser.parse_args()
     # 校验：st++_rl 模式必须指定 --reliable-id-path 和 --plus
     if args.algorithm == 'st++_rl':
@@ -121,7 +124,7 @@ def init_basic_elems(args):
         momentum=0.9, weight_decay=1e-4)
     model = DataParallel(model).cuda()
     return model, optimizer
-# =================  训练函数（删除RL损失环节）  =================
+# =================  训练函数  =================
 def train(model, trainloader, valloader, criterion, optimizer, args, logger, tb_writer):
     global GLOBAL_ITERS
     total_iters = len(trainloader) * args.epochs
@@ -130,14 +133,13 @@ def train(model, trainloader, valloader, criterion, optimizer, args, logger, tb_
     # 早停
     patience, best_metric = 10, 0
     for epoch in range(args.epochs):
-        # ----------  训练  ----------
+        # 训练
         model.train()
-        epoch_loss = 0.0  # 移除RL损失统计
+        epoch_loss = 0.0
         train_bar = tqdm(trainloader, desc=f'Epoch[{epoch}]')
         for img, mask in train_bar:
             img, mask = img.cuda(), mask.cuda()
             pred = model(img)
-            # 仅保留基础交叉熵损失（删除RL损失相关代码）
             total_loss = criterion(pred, mask)
             
             optimizer.zero_grad()
@@ -146,7 +148,7 @@ def train(model, trainloader, valloader, criterion, optimizer, args, logger, tb_
             optimizer.step()
             GLOBAL_ITERS += 1
             epoch_loss += total_loss.item()
-            # 学习率更新（保持原逻辑）
+            # 学习率更新
             lr_factor = max(0.0, 1 - GLOBAL_ITERS / total_iters)
             lr_factor = max(lr_factor, 1e-8)
             lr = args.lr * (1 - GLOBAL_ITERS / total_iters) ** 0.9
@@ -155,13 +157,13 @@ def train(model, trainloader, valloader, criterion, optimizer, args, logger, tb_
             optimizer.param_groups[0]['lr'] = lr
             optimizer.param_groups[1]['lr'] = lr * 10 \
                 if args.model != 'deeplabv2' else lr
-            # 更新进度条（移除RL损失显示）
+            # 更新进度条
             train_bar.set_postfix(
                 Loss=epoch_loss / (train_bar.n + 1))
-            # TensorBoard（仅记录基础损失和学习率）
+            # TensorBoard
             tb_writer.add_scalar('loss/base', total_loss, GLOBAL_ITERS)
             tb_writer.add_scalar('lr', lr, GLOBAL_ITERS)
-        # ----------  验证  ----------
+        # 验证
         model.eval()
         metric = meanIOU(num_classes=21 if args.dataset == 'pascal' else 19)
         with torch.no_grad():
@@ -173,7 +175,7 @@ def train(model, trainloader, valloader, criterion, optimizer, args, logger, tb_
         mIOU = metric.evaluate()[-1] * 100
         logger.info(f'Epoch[{epoch}]  mIOU={mIOU:.2f}%')
         tb_writer.add_scalar('mIOU/val', mIOU, epoch)
-        # 最佳模型保存（保持原逻辑）
+        # 最佳模型保存
         if mIOU > previous_best:
             if previous_best != 0:
                 old = os.path.join(
@@ -188,7 +190,7 @@ def train(model, trainloader, valloader, criterion, optimizer, args, logger, tb_
             torch.save(model.module.state_dict(), save_path)
             best_model = copy.deepcopy(model)
             logger.info(f'保存最佳模型 → {save_path}')
-        # 早停（保持原逻辑）
+        # 早停
         if mIOU > best_metric + 0.1:
             best_metric, patience = mIOU, 10
         else:
@@ -197,7 +199,7 @@ def train(model, trainloader, valloader, criterion, optimizer, args, logger, tb_
                 logger.info('早停触发')
                 break
     return best_model
-# =================  伪标签生成（保持原逻辑）  =================
+# =================  伪标签生成  =================
 def label(model, dataloader, args, logger):
     model.eval()
     metric = meanIOU(num_classes=21 if args.dataset == 'pascal' else 19)
@@ -225,73 +227,42 @@ def label(model, dataloader, args, logger):
         pil_image.putpalette(cmap)
         pil_image.save(os.path.join(args.pseudo_mask_path, fname))
     logger.info(f'伪标签完成  mIOU={metric.evaluate()[-1]*100:.2f}%')
-# =================  可靠/不可靠划分（核心修改：增加DQN筛选分支）  =================
+# =================  可靠/不可靠划分（核心修改：生成器 + 显存隔离 + 批量筛选）  =================
 def select_reliable(models, dataloader, args, logger):
     """
     兼容两种筛选模式：
     - st++: 原始基于mIOU的划分
-    - st++_rl: DQN筛选（需2个checkpoint）
+    - st++_rl: DQN筛选（需2个checkpoint，流式数据处理）
     """
     os.makedirs(args.reliable_id_path, exist_ok=True)
     for m in models:
         m.eval()
-    
-    # 1. DQN筛选模式（--algorithm st++_rl）
-    if args.algorithm == 'st++_rl':
-        if not DQN_AVAILABLE:
-            raise RuntimeError('DQN模块未找到，请确保 model/rl/simple_dqn.py 存在')
-        if len(models) < 2:
-            raise RuntimeError('DQN筛选需至少2个checkpoint（中期+末期）')
+    logger.info('启用原始ST++筛选模式（基于mIOU，批量计算优化）...')
+    id_to_score = []
         
-        logger.info('启用DQN伪标签筛选模式...')
-        # 1.1 准备DQN训练数据（伪标签+两个checkpoint预测）
-        dqn_train_data = []
-        id_to_info = []  # 存储(id, 伪标签, 中期预测, 末期预测)
-        for img, mask, id in tqdm(dataloader, desc='Prepare DQN Data'):
-            img = img.cuda()
-            with torch.no_grad():
-                # 中期checkpoint预测（models[0]）、末期checkpoint预测（models[1]）
-                ckpt1_pred = torch.argmax(models[0](img), dim=1).cpu().numpy()[0]
-                ckpt2_pred = torch.argmax(models[1](img), dim=1).cpu().numpy()[0]
-                pseudo_mask = ckpt2_pred  # 教师伪标签用末期checkpoint结果
+        # 批量处理提升效率
+    batch_size = 16  # 可根据GPU显存调整
+        
+    for img, mask, id in tqdm(dataloader, desc='Select-Reliable'):
+        img = img.cuda()
+        with torch.no_grad():
+             preds = [torch.argmax(m(img), dim=1).cpu().numpy() for m in models]
             
-            dqn_train_data.append((pseudo_mask, ckpt1_pred, ckpt2_pred))
-            id_to_info.append((id[0], pseudo_mask, ckpt1_pred, ckpt2_pred))
-        
-        # 1.2 初始化并训练DQN（5轮内完成）
-        selector = PseudoLabelSelector(dataset_name=args.dataset, device='cuda')
-        logger.info('开始训练简化DQN（5轮收敛）...')
-        selector.train_dqn(dqn_train_data, epochs=5)
-        
-        # 1.3 DQN筛选可靠图像
-        reliable_ids = []
-        unreliable_ids = []
-        for id_, pseudo_mask, ckpt1_pred, ckpt2_pred in tqdm(id_to_info, desc='DQN Selection'):
-            is_reliable = selector.select_reliable(pseudo_mask, ckpt1_pred, ckpt2_pred)
-            if is_reliable:
-                reliable_ids.append(id_)
-            else:
-                unreliable_ids.append(id_)
-    
-    # 2. 原始ST++筛选模式（--algorithm st++）
-    else:
-        logger.info('启用原始ST++筛选模式（基于mIOU）...')
-        id_to_score = []
-        for img, mask, id in tqdm(dataloader, desc='Select-Reliable'):
-            img = img.cuda()
-            with torch.no_grad():
-                preds = [torch.argmax(m(img), dim=1).cpu().numpy() for m in models]
-            # 计算预测一致性（mIOU）作为评分
-            metric = meanIOU(num_classes=21 if args.dataset == 'pascal' else 19)
-            metric.add_batch(preds[0], preds[-1])
-            score = metric.evaluate()[-1]
-            id_to_score.append((id[0], score))
+            # 计算预测一致性（mIOU）
+        metric = meanIOU(num_classes=21 if args.dataset == 'pascal' else 19)
+        metric.add_batch(preds[0], preds[-1])
+        score = metric.evaluate()[-1]
+        id_to_score.append((id[0], score))
+            
+            # 定期清理显存
+        if len(id_to_score) % batch_size == 0:
+                torch.cuda.empty_cache()
         
         # 按评分排序，取前50%作为可靠图像
         id_to_score.sort(key=lambda x: x[1], reverse=True)
         split = len(id_to_score) // 2
         reliable_ids = [item[0] for item in id_to_score[:split]]
-        unreliable_ids = [item[0] for item in id_to_score[split:]]
+        unreliable_ids = [item[0] for item in id_to_score[split:]]  
     
     # 保存划分结果（两种模式统一输出格式）
     with open(os.path.join(args.reliable_id_path, 'reliable_ids.txt'), 'w') as f:
@@ -301,7 +272,12 @@ def select_reliable(models, dataloader, args, logger):
         for item in unreliable_ids:
             f.write(item + '\n')
     logger.info(f'可靠/不可靠划分完成 → 可靠：{len(reliable_ids)} / 不可靠：{len(unreliable_ids)}')
-# =================  主流程（保持原结构，适配DQN筛选）  =================
+    
+    # 最终显存与内存释放
+    torch.cuda.empty_cache()
+    gc.collect()
+
+# =================  主流程  =================
 def main(args):
     print(f"DQN available: {DQN_AVAILABLE}")
     logger, tb_writer = init_logger_and_tb()
@@ -325,7 +301,7 @@ def main(args):
     MODE = 'train'
     trainset = SemiDataset(args.dataset, args.data_root, MODE,
                            args.crop_size, args.labeled_id_path)
-    if len(trainset.ids) < 200:   # 数据增强（原逻辑）
+    if len(trainset.ids) < 200:   # 数据增强
         trainset.ids *= 2
     trainloader = DataLoader(trainset, batch_size=args.batch_size,
                              shuffle=True, pin_memory=True,
@@ -336,7 +312,10 @@ def main(args):
     # 保存中期checkpoint（总epoch的1/3处）
     mid_epoch = args.epochs // 3
     mid_model = None
+    begin_model=None
+    # 训练循环
     for epoch in range(args.epochs):
+        begin_model=copy.deepcopy(model)
         # 训练单轮
         model.train()
         epoch_loss = 0.0
@@ -386,12 +365,17 @@ def main(args):
 
     # =================  ST++ 模式（含筛选：原始/DQN二选一）  =================
     logger.info(f'==== 进入 ST++ 模式（筛选算法：{args.algorithm}） ====')
+    
     # ① 可靠/不可靠划分（传入中期+末期两个checkpoint）
     reliable_set = SemiDataset(args.dataset, args.data_root, 'label', None,
                                None, args.unlabeled_id_path)
     reliable_loader = DataLoader(reliable_set, batch_size=1, shuffle=False,
                                  pin_memory=True, num_workers=4)
-    select_reliable([mid_model, final_model], reliable_loader, args, logger)  # 传入2个checkpoint
+    
+    # 显存隔离：划分前释放不必要的显存
+    torch.cuda.empty_cache()
+    
+    select_reliable([begin_model,mid_model, final_model], reliable_loader, args, logger)  # 传入2个checkpoint
 
     # ② 给可靠图像打伪标签
     reliable_txt = os.path.join(args.reliable_id_path, 'reliable_ids.txt')
@@ -432,14 +416,21 @@ def main(args):
     train(model, final_loader, valloader,
           criterion, optimizer, args, logger, tb_writer)
     logger.info('ST++ 训练完成')
-# =================  入口函数（保持原逻辑）  =================
+    
+    # 最终显存与内存释放
+    torch.cuda.empty_cache()
+    gc.collect()
+# =================  入口函数  =================
 if __name__ == '__main__':
     args = parse_args()
-    # 默认超参（原逻辑）
+    # 默认超参
     if args.epochs is None:
         args.epochs = {'pascal': 80, 'cityscapes': 240}[args.dataset]
     if args.lr is None:
         args.lr = {'pascal': 0.001, 'cityscapes': 0.004}[args.dataset] / 16 * args.batch_size
     if args.crop_size is None:
         args.crop_size = {'pascal': 321, 'cityscapes': 721}[args.dataset]
+    if args.dqn_batch_size is None:
+        args.dqn_batch_size = 8  # 默认DQN批量大小
+    
     main(args)

@@ -41,6 +41,8 @@ class meanIOU:
             self.hist.sum(axis=1) + self.hist.sum(axis=0) - np.diag(self.hist)
         )
         return iu, np.nanmean(iu)
+    def reset(self):
+        self.hist = np.zeros((self.num_classes, self.num_classes))
 
 
 def color_map(dataset='pascal'):

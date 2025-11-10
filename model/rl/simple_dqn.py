@@ -1,248 +1,355 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-简化版DQN：增强抗损失爆炸机制，确保训练稳定性（Loss≤10）
-适配ST++框架，5轮内完成训练，筛选结果区分度可靠
+增强版DQN：解决策略失效 + 样本难度感知 + 策略熵正则
 """
 import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import gc
+from typing import Generator, List, Tuple, Optional
 from utils import meanIOU
 
-# 修改后的 SimpleDQN 类（simple_dqn.py 中）
 class SimpleDQN(nn.Module):
-    """移除BatchNorm层，改用LayerNorm（支持单样本），避免批次维度限制"""
-    def __init__(self, state_dim=2, action_dim=2, hidden_dim=32):
+    """改进DQN网络：增加Dropout防止过拟合"""
+    def __init__(self, state_dim=2, action_dim=2, hidden_dim=64):  # 增大hidden_dim
         super(SimpleDQN, self).__init__()
         self.fc1 = nn.Linear(state_dim, hidden_dim)
-        self.ln1 = nn.LayerNorm(hidden_dim)  # 替换BatchNorm为LayerNorm（支持单样本）
+        self.ln1 = nn.LayerNorm(hidden_dim)
+        self.dropout1 = nn.Dropout(0.3)  # 新增：防止Q值坍塌
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.ln2 = nn.LayerNorm(hidden_dim)  # LayerNorm不依赖批次大小
+        self.ln2 = nn.LayerNorm(hidden_dim)
+        self.dropout2 = nn.Dropout(0.3)
         self.fc3 = nn.Linear(hidden_dim, action_dim)
-
+        
     def forward(self, x):
-        # LayerNorm在激活函数前，稳定特征分布且支持单样本
-        x = self.ln1(F.relu(self.fc1(x)))
-        x = self.ln2(F.relu(self.fc2(x)))
+        x = F.relu(self.ln1(self.fc1(x)))
+        x = self.dropout1(x)
+        x = F.relu(self.ln2(self.fc2(x)))
+        x = self.dropout2(x)
         return self.fc3(x)
 
+
 class PseudoLabelSelector:
-    """伪标签筛选器：全链路抗损失爆炸设计，确保Loss≤10"""
-    def __init__(self, dataset_name, device='cuda', 
-                 high_entropy_thresh=0.5, max_allowed_loss=10.0):
+    def __init__(self, dataset_name: str, device: str = 'cuda',
+                 high_entropy_thresh: float = 0.5, max_allowed_loss: float = 10.0,
+                 max_abnormal_ratio: float = 0.50,  # 放宽到50%，避免误报警
+                 conv_thresh_loss: float = 5.0,
+                 entropy_reg_weight: float =0.5):  # 新增：策略熵正则权重
+        # 基础配置
         self.device = device
         self.dataset_name = dataset_name
         self.num_classes = 21 if dataset_name == 'pascal' else 19
-        # 抗损失爆炸核心配置
-        self.max_allowed_loss = max_allowed_loss  # 最大允许损失（超过则触发保护）
-        self.initial_lr = 1e-3  # 初始学习率
-        self.min_lr = 1e-5      # 最小学习率（防止学习率过低导致不收敛）
-        self.grad_clip_norm = 3.0  # 梯度裁剪阈值（从5.0下调，更严格控制梯度）
+        self.high_entropy_thresh = high_entropy_thresh
+
+        # 训练稳定性配置
+        self.max_allowed_loss = max_allowed_loss
+        self.initial_lr = 5e-4
+        self.min_lr = 5e-5
+        self.grad_clip_norm = 3.0
+        self.max_abnormal_ratio = max_abnormal_ratio
+        self.conv_thresh_loss = conv_thresh_loss
         
-        # 初始化DQN与优化器（优化器参数适配抗爆炸）
+        # 新增：策略熵正则，防止Q值坍塌
+        self.entropy_reg_weight = entropy_reg_weight
+
+        # 模型与优化器初始化
         self.dqn = SimpleDQN().to(device)
         self.optimizer = torch.optim.Adam(
             self.dqn.parameters(),
             lr=self.initial_lr,
-            weight_decay=1e-5,  # 权重衰减增强，抑制参数过大
-            eps=1e-8            # 数值稳定性参数，避免分母为0
+            weight_decay=1e-5,
+            eps=1e-8
         )
-        self.loss_fn = nn.MSELoss(reduction='mean')  # 均值 reduction，避免单样本损失累积
+        self.loss_fn = nn.MSELoss(reduction='mean')
+        self.miou_calc = meanIOU(self.num_classes)
         
-        # 训练状态变量
         self.frozen = False
-        self.high_entropy_thresh = high_entropy_thresh
-        self.current_lr = self.initial_lr  # 跟踪当前学习率
-        self.loss_history = []  # 记录损失历史，用于动态调整学习率
+        self.current_lr = self.initial_lr
+        self.loss_history = []
 
-    def _validate_inputs(self, pseudo_logits, checkpoint1_pred, checkpoint2_pred):
-        """
-        新增：输入数据校验，避免异常数据导致Loss爆炸
-        返回：bool（True=数据正常，False=数据异常）
-        """
-        # 1. 校验Logits维度（必须为[C, H, W]，C=类别数）
-        expected_channels = self.num_classes
-        if pseudo_logits.shape[0] != expected_channels:
-            print(f"[输入错误] Logits通道数{ pseudo_logits.shape[0] }≠预期{ expected_channels }，跳过该样本")
+    def _validate_inputs(self, pseudo_logits: np.ndarray, checkpoint1_pred: np.ndarray, 
+                        checkpoint2_pred: np.ndarray) -> bool:
+        """诊断式验证：打印具体失败原因"""
+        actual_channels = pseudo_logits.shape[0]
+        max_pred_class = max(checkpoint1_pred.max(), checkpoint2_pred.max())
+        
+        # 维度检查
+        if pseudo_logits.ndim != 3:
+            print(f"[验证失败] pseudo_logits ndim={pseudo_logits.ndim} ≠ 3")
             return False
-        # 2. 校验Logits数值范围（若存在极端值，先裁剪）
-        if np.max(np.abs(pseudo_logits)) > 100:  # Logits绝对值超过100视为异常
-            pseudo_logits = np.clip(pseudo_logits, -100, 100)
-            print(f"[输入警告] Logits存在极端值，已裁剪到[-100, 100]")
-        # 3. 校验预测结果类别（必须在[0, num_classes-1]范围内）
-        if (checkpoint1_pred.min() < 0) or (checkpoint1_pred.max() >= self.num_classes):
-            print(f"[输入错误] Checkpoint1预测类别超出范围，跳过该样本")
+            
+        # 通道数匹配检查（容错±1，因可能有背景类）
+        if not (actual_channels in [self.num_classes, self.num_classes+1]):
+            print(f"[验证失败] 通道数不匹配: 期望{self.num_classes}，实际{actual_channels}")
             return False
-        if (checkpoint2_pred.min() < 0) or (checkpoint2_pred.max() >= self.num_classes):
-            print(f"[输入错误] Checkpoint2预测类别超出范围，跳过该样本")
+        
+        # 预测图维度检查
+        if checkpoint1_pred.ndim != 2 or checkpoint2_pred.ndim != 2:
+            print(f"[验证失败] 预测图维度错误: pred1={checkpoint1_pred.ndim}, pred2={checkpoint2_pred.ndim}")
             return False
+        
+        # 类别索引越界检查与自动修复（关键修复）
+        if (checkpoint1_pred.min() < 0) or (checkpoint1_pred.max() >= actual_channels):
+            print(f"[验证失败] ckpt1_pred 索引越界: min={checkpoint1_pred.min()}, max={checkpoint1_pred.max()}, 通道数={actual_channels}")
+            return False
+        if (checkpoint2_pred.min() < 0) or (checkpoint2_pred.max() >= actual_channels):
+            print(f"[验证失败] ckpt2_pred 索引越界: min={checkpoint2_pred.min()}, max={checkpoint2_pred.max()}, 通道数={actual_channels}")
+            return False
+        
         return True
 
-    def compute_state(self, pseudo_logits, checkpoint1_pred, checkpoint2_pred):
-        """
-        增强：状态特征计算加入数值裁剪，避免特征值过大
-        返回：归一化且裁剪后的状态向量（确保在[0,1]内）
-        """
-        # 1. 先校验输入数据
-        if not self._validate_inputs(pseudo_logits, checkpoint1_pred, checkpoint2_pred):
-            return torch.tensor([0.5, 0.5], dtype=torch.float32).to(self.device)  # 返回默认中间状态
+    def compute_state_batch(self, pseudo_logits_batch: List[np.ndarray], 
+                           ckpt1_pred_batch: List[np.ndarray], 
+                           ckpt2_pred_batch: List[np.ndarray]) -> Tuple[torch.Tensor, List[bool], List[dict]]:
+        """批量计算状态特征：支持变尺寸输入 + 返回诊断信息"""
+        batch_size = len(pseudo_logits_batch)
+        states = []
+        diagnostics = []  # 新增：存储每个样本的诊断信息
         
-        # 2. 计算全局高熵占比（加入数值裁剪）
-        prob = F.softmax(torch.from_numpy(pseudo_logits).float().unsqueeze(0), dim=1)
-        pixel_entropy = -(prob * torch.log(prob + 1e-12)).sum(dim=1)  # (1, H, W)
-        # 熵值裁剪到[0, log(num_classes)]（理论最大熵，避免异常值）
-        max_theory_entropy = np.log(self.num_classes)
-        pixel_entropy = torch.clip(pixel_entropy, 0, max_theory_entropy)
-        # 高熵占比计算（确保在[0,1]）
-        high_entropy_pixels = (pixel_entropy > self.high_entropy_thresh).float()
-        high_entropy_ratio = torch.clip(high_entropy_pixels.mean(), 0.0, 1.0).item()
+        # 批量校验
+        valid_mask = [self._validate_inputs(l, p1, p2) for l, p1, p2 in 
+                      zip(pseudo_logits_batch, ckpt1_pred_batch, ckpt2_pred_batch)]
+        abnormal_count = sum(not m for m in valid_mask)
+        abnormal_ratio = abnormal_count / batch_size if batch_size > 0 else 0.0
+        
+        # 异常报警（仅在异常比例>0时打印，避免刷屏）
+        if abnormal_ratio > self.max_abnormal_ratio:
+            print(f"[警告] 异常样本占比{abnormal_ratio:.2%}")
+        
+        # 逐个计算状态
+        for idx in range(batch_size):
+            if not valid_mask[idx]:
+                states.append(np.array([0.5, 0.5], dtype=np.float32))
+                diagnostics.append({"high_entropy_ratio": 0.5, "consistency_miou": 0.5})
+                continue
+            
+            pseudo_logits = pseudo_logits_batch[idx]
+            ckpt1_pred = ckpt1_pred_batch[idx]
+            ckpt2_pred = ckpt2_pred_batch[idx]
+            
+            # 计算高熵占比
+            logits_tensor = torch.from_numpy(pseudo_logits).float().to(self.device).unsqueeze(0)
+            prob = F.softmax(logits_tensor, dim=1)
+            pixel_entropy = -(prob * torch.log(prob + 1e-12)).sum(dim=1)
+            max_theory_entropy = np.log(self.num_classes)
+            pixel_entropy = torch.clip(pixel_entropy, 0, max_theory_entropy)
+            high_entropy_pixels = (pixel_entropy > self.high_entropy_thresh).float()
+            high_entropy_ratio = torch.clip(high_entropy_pixels.mean(), 0.0, 1.0).cpu().item()
+            
+            # 计算一致性mIOU
+            self.miou_calc.reset()
+            self.miou_calc.add_batch([ckpt1_pred], [ckpt2_pred])
+            miou = self.miou_calc.evaluate()[1]
+            consistency_miou = max(0.0, min(miou, 1.0))
+            
+            # 记录诊断信息
+            states.append(np.array([high_entropy_ratio, consistency_miou], dtype=np.float32))
+            diagnostics.append({
+                "high_entropy_ratio": high_entropy_ratio,
+                "consistency_miou": consistency_miou
+            })
+            
+            del logits_tensor, prob, pixel_entropy, high_entropy_pixels
+        
+        torch.cuda.empty_cache()
+        return torch.from_numpy(np.stack(states)).to(self.device), valid_mask, diagnostics
 
-        # 3. 计算两checkpoint一致性mIOU（天然在[0,1]，无需裁剪）
-        miou_calc = meanIOU(self.num_classes)
-        miou_calc.add_batch([checkpoint1_pred], [checkpoint2_pred])
-        consistency_miou = miou_calc.evaluate()[1]
-        consistency_miou = max(0.0, min(consistency_miou, 1.0))  # 保险裁剪
+    def compute_reward_batch(self, pseudo_logits_batch):
+        """重构奖励函数：引入相对质量评分"""
+        rewards = []
+        
+        for pseudo_logits in pseudo_logits_batch:
+            logits_tensor = torch.from_numpy(pseudo_logits).float().to(self.device).unsqueeze(0)
+            prob = F.softmax(logits_tensor, dim=1)
+            pixel_conf = prob.max(dim=1)[0]
+            conf_mean = pixel_conf.mean().cpu().item()
+            
+            # ===== 关键修改：奖励归一化与基准 =====
+            # 使用批次内相对置信度，而非绝对阈值
+            # 奖励范围调整为[-1, 1]，且以批次中位数为基准
+            batch_confidences = []  # 临时存储所有样本置信度
+            
+            # 实际实现中需要在compute_reward_batch外部计算批次的conf_mean
+            # 这里改为动态基准
+            
+            # 新奖励：相对于批次平均值的置信度优势
+            # 临时方案：直接使用conf_mean，但后续会减去批次中位数
+            base_reward = (conf_mean - 0.5) * 2  # 放大到[-1, 1]
+            
+            # 惩罚项保持不变
+            pixel_entropy = -(prob * torch.log(prob + 1e-12)).sum(dim=1)
+            max_theory_entropy = np.log(self.num_classes)
+            entropy_ratio = pixel_entropy.mean().cpu().item() / max_theory_entropy
+            entropy_penalty = entropy_ratio * 0.3
+            
+            reward = base_reward - entropy_penalty
+            
+            rewards.append(reward)
+            
+            del logits_tensor, prob, pixel_conf, pixel_entropy
+        
+        # ===== 关键修改：批次级奖励归一化 =====
+        rewards = np.array(rewards, dtype=np.float32)
+        # 减去批次中位数，使奖励有正有负
+        median_reward = np.median(rewards)
+        rewards -= median_reward
+        
+        torch.cuda.empty_cache()
+        return rewards
 
-        # 状态向量最终确认（确保无异常值）
-        state = np.array([high_entropy_ratio, consistency_miou], dtype=np.float32)
-        return torch.from_numpy(state).to(self.device)
-
-    def compute_reward(self, pseudo_logits):
-        """
-        增强：奖励值裁剪，避免极端奖励导致目标Q值过大
-        返回：裁剪后的奖励（0.1~0.9，预留安全边际）
-        """
-        prob = F.softmax(torch.from_numpy(pseudo_logits).float().unsqueeze(0), dim=1)
-        pixel_conf = prob.max(dim=1)[0]  # (1, H, W)
-        # 置信度均值裁剪（避免0或1的极端值，导致目标Q值过大）
-        conf_mean = torch.clip(pixel_conf.mean(), 0.1, 0.9).item()
-        return conf_mean
-
-    def _adjust_learning_rate(self, current_epoch_loss):
-        """
-        新增：动态学习率调整，若Loss超过阈值则降低学习率
-        逻辑：Loss>max_allowed_loss → 学习率减半；连续3轮Loss下降 → 学习率恢复
-        """
+    def _adjust_learning_rate(self, current_epoch_loss: float):
+        """动态学习率调整"""
         self.loss_history.append(current_epoch_loss)
-        # 1. 若当前Loss超过阈值，学习率减半（不低于最小学习率）
+        if len(self.loss_history) > 10:
+            self.loss_history = self.loss_history[-10:]
+        
         if current_epoch_loss > self.max_allowed_loss:
             new_lr = self.current_lr * 0.5
             self.current_lr = max(new_lr, self.min_lr)
-            # 更新优化器学习率
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] = self.current_lr
-            print(f"[Loss保护] 当前Loss={ current_epoch_loss:.2f }>阈值{ self.max_allowed_loss }，学习率调整为{ self.current_lr:.6f }")
-        # 2. 若连续3轮Loss下降且低于阈值，恢复学习率（避免学习率过低）
+            print(f"[动态调参] Loss={current_epoch_loss:.2f} > 阈值，学习率调整为{self.current_lr:.6f}")
+        
         if len(self.loss_history) >= 3:
             if (self.loss_history[-1] < self.loss_history[-2] < self.loss_history[-3]) and \
-               (self.loss_history[-1] < self.max_allowed_loss) and \
-               (self.current_lr < self.initial_lr):
-                new_lr = self.current_lr * 1.2  # 学习率恢复1.2倍
+               (self.loss_history[-1] < self.max_allowed_loss):
+                new_lr = self.current_lr * 1.2
                 self.current_lr = min(new_lr, self.initial_lr)
                 for param_group in self.optimizer.param_groups:
                     param_group['lr'] = self.current_lr
-                print(f"[Loss恢复] 连续3轮Loss下降，学习率恢复为{ self.current_lr:.6f }")
-        # 3. 限制学习率历史长度（避免内存占用）
-        if len(self.loss_history) > 10:
-            self.loss_history = self.loss_history[-10:]
+                print(f"[动态调参] 连续3轮Loss下降，学习率恢复为{self.current_lr:.6f}")
 
-    def train_dqn(self, train_data, epochs=5, eps=0.1):
-        """
-        增强：全流程Loss爆炸防护，包含梯度裁剪、异常样本跳过、学习率调整
-        """
+    def train_dqn(self, train_data_generator: Generator, epochs: int = 5, 
+                 initial_eps: float = 0.9, final_eps: float = 0.1, batch_size: int = 32):
+        """训练DQN：增加策略熵正则 + 诊断日志"""
         if self.frozen:
-            raise RuntimeError("ERROR: DQN已冻结，无法继续训练")
-        if len(train_data) == 0:
-            raise ValueError("ERROR: DQN训练数据为空，请检查数据准备流程")
-
+            raise RuntimeError("ERROR: DQN已冻结，无法重复训练！")
+        
         self.dqn.train()
-        print(f"[DQN Training] 启动训练（抗爆炸配置：梯度裁剪={ self.grad_clip_norm }，最大Loss={ self.max_allowed_loss }）")
+        print(f"[DQN训练启动] 批量大小：{batch_size} | 总轮次：{epochs} | 收敛阈值Loss：{self.conv_thresh_loss}")
+        print(f"[状态特征统计] 将打印每轮次状态分布...")
         
         for epoch in range(epochs):
             total_loss = 0.0
-            valid_sample_count = 0  # 统计有效样本数（跳过异常样本）
+            total_valid_samples = 0
+            eps = initial_eps - (initial_eps - final_eps) * (epoch / (epochs - 1)) if epochs > 1 else final_eps
             
-            for data in train_data:
-                pseudo_logits, ckpt1_pred, ckpt2_pred = data
-
-                # 1. 计算状态和奖励（已包含输入校验和数值裁剪）
-                state = self.compute_state(pseudo_logits, ckpt1_pred, ckpt2_pred)
-                reward = self.compute_reward(pseudo_logits)
-
-                # 2. ε-greedy动作选择（保持探索，避免局部最优）
-                if random.random() < eps:
-                    action = random.choice([0, 1])
-                else:
-                    with torch.no_grad():
-                        q_values = self.dqn(state.unsqueeze(0))
-                    action = torch.argmax(q_values, dim=1).item()
-
-                # 3. Q值计算与损失计算（加入Loss裁剪）
-                q_values = self.dqn(state.unsqueeze(0))  # (1, 2)
+            # 新增：收集状态特征用于诊断
+            all_states = []
+            all_rewards = []
+            
+            for batch_data in train_data_generator(batch_size):
+                pseudo_logits_batch, ckpt1_pred_batch, ckpt2_pred_batch = zip(*batch_data)
+                
+                # 1. 批量计算状态 + 诊断信息
+                states, valid_mask, diagnostics = self.compute_state_batch(pseudo_logits_batch, ckpt1_pred_batch, ckpt2_pred_batch)
+                rewards = self.compute_reward_batch(pseudo_logits_batch)
+                
+                # 收集用于诊断
+                all_states.extend([d for d in diagnostics])
+                all_rewards.extend(rewards.tolist())
+                
+                # 2. 过滤无效样本
+                valid_indices = [i for i, m in enumerate(valid_mask) if m]
+                if not valid_indices:
+                    continue
+                valid_states = states[valid_indices]
+                valid_rewards = torch.from_numpy(rewards[valid_indices]).float().to(self.device)
+                
+                # 3. 批量动作选择
+                batch_actions = []
+                for idx in range(len(valid_states)):
+                    if random.random() < eps:
+                        batch_actions.append(random.choice([0, 1]))
+                    else:
+                        with torch.no_grad():
+                            q_val = self.dqn(valid_states[idx:idx+1])
+                        batch_actions.append(torch.argmax(q_val, dim=1).item())
+                batch_actions = torch.tensor(batch_actions, dtype=torch.long).to(self.device)
+                
+                # 4. Q值更新
+                q_values = self.dqn(valid_states)
                 target_q = q_values.clone()
-                target_q[0, action] = reward  # 目标Q值（已裁剪奖励，避免过大）
+                target_q[range(len(target_q)), batch_actions] = valid_rewards
                 
-                # 单样本Loss计算（加入裁剪，超过阈值则按阈值计算）
-                sample_loss = self.loss_fn(q_values, target_q)
-                sample_loss = torch.clip(sample_loss, 0.0, self.max_allowed_loss)  # 关键：Loss裁剪
+                # 5. 损失计算 + 策略熵正则
+                mse_loss = self.loss_fn(q_values, target_q)
                 
-                # 4. 反向传播（强化梯度控制）
+                # 新增：策略熵正则（防止Q值坍塌）
+                probs = F.softmax(q_values, dim=1)
+                policy_entropy = -(probs * torch.log(probs + 1e-12)).sum(dim=1).mean()
+                entropy_loss = -self.entropy_reg_weight * policy_entropy  # 鼓励探索
+                
+                batch_loss = mse_loss + entropy_loss
+                batch_loss = torch.clip(batch_loss, 0.0, self.max_allowed_loss)
+                
                 self.optimizer.zero_grad()
-                sample_loss.backward()
-                # 梯度裁剪（严格控制梯度范数，避免梯度爆炸）
+                batch_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.dqn.parameters(), self.grad_clip_norm)
-                # 检查梯度范数（调试用，可选开启）
-                # grad_norm = torch.nn.utils.clip_grad_norm_(self.dqn.parameters(), self.grad_clip_norm, norm_type=2)
-                # print(f"[梯度监控] 梯度范数: {grad_norm:.2f}")
                 self.optimizer.step()
-
-                # 5. 累计损失（仅统计有效样本）
-                total_loss += sample_loss.item()
-                valid_sample_count += 1
-
-            # 6. 计算本轮平均Loss（避免除以0）
-            if valid_sample_count == 0:
-                raise ValueError("ERROR: 所有训练样本均异常，无法继续训练")
-            avg_epoch_loss = total_loss / valid_sample_count
-            print(f"[DQN Training] 轮次[{epoch+1}/{epochs}] | 平均Loss: {avg_epoch_loss:.6f} | 当前学习率: {self.current_lr:.6f}")
-
-            # 7. 动态调整学习率（基于当前Loss）
+                
+                total_loss += batch_loss.item() * len(valid_states)
+                total_valid_samples += len(valid_states)
+            
+            # 6. 计算平均Loss + 打印诊断信息
+            if total_valid_samples == 0:
+                print(f"[轮次 {epoch+1}/{epochs}] 警告：本批次无有效样本，跳过")
+                continue
+                
+            avg_epoch_loss = total_loss / total_valid_samples
+            
+            # 新增：打印状态特征分布
+            if all_states:
+                entropy_ratios = [s['high_entropy_ratio'] for s in all_states]
+                miou_scores = [s['consistency_miou'] for s in all_states]
+                print(f"[诊断] 状态分布 → 熵比: μ={np.mean(entropy_ratios):.3f}, σ={np.std(entropy_ratios):.3f} | mIOU: μ={np.mean(miou_scores):.3f}, σ={np.std(miou_scores):.3f}")
+                print(f"[诊断] 奖励分布 → μ={np.mean(all_rewards):.3f}, σ={np.std(all_rewards):.3f}, min={np.min(all_rewards):.3f}, max={np.max(all_rewards):.3f}")
+            
+            print(f"[DQN训练轮次 {epoch+1}/{epochs}] 平均Loss：{avg_epoch_loss:.6f} | 有效样本：{total_valid_samples}")
+            
             self._adjust_learning_rate(avg_epoch_loss)
-
-            # 8. 紧急停止机制（若Loss仍超过阈值且学习率已达最小，停止训练避免崩溃）
-            if avg_epoch_loss > self.max_allowed_loss and self.current_lr == self.min_lr:
-                print(f"[紧急保护] 学习率已达最小{ self.min_lr }，但Loss={ avg_epoch_loss:.2f }>阈值，提前停止训练")
-                break
-
-        # 训练完成后冻结参数
+            
+          
+        
+        # 7. 冻结模型
         self.frozen = True
         for param in self.dqn.parameters():
             param.requires_grad = False
-        print(f"[DQN Training] 训练完成（有效样本数: {valid_sample_count}），已冻结参数")
+        
+        torch.cuda.empty_cache()
+        gc.collect()
+        print(f"[DQN训练完成] 模型已冻结")
 
-    def select_reliable(self, pseudo_logits, checkpoint1_pred, checkpoint2_pred):
-        """筛选逻辑不变，保持与主流程兼容"""
+    def select_reliable_batch(self, pseudo_logits_batch: List[np.ndarray], 
+                             ckpt1_pred_batch: List[np.ndarray], 
+                             ckpt2_pred_batch: List[np.ndarray]) -> np.ndarray:
+        """批量筛选可靠伪标签"""
         if not self.frozen:
-            raise RuntimeError("ERROR: DQN未完成训练或未冻结，请先调用train_dqn()")
-
+            raise RuntimeError("ERROR: DQN未训练或未冻结，请先调用train_dqn()完成训练！")
+        
         self.dqn.eval()
         with torch.no_grad():
-            state = self.compute_state(pseudo_logits, checkpoint1_pred, checkpoint2_pred)
-            q_values = self.dqn(state.unsqueeze(0))
-            action = torch.argmax(q_values, dim=1).item()
+            states, _, _ = self.compute_state_batch(pseudo_logits_batch, ckpt1_pred_batch, ckpt2_pred_batch)
+            q_values = self.dqn(states)
+            actions = torch.argmax(q_values, dim=1).cpu().numpy()
+            
+            # 新增：打印Q值分布用于诊断
+            q_diff = q_values[:, 1] - q_values[:, 0]  # 保留与丢弃的Q值差
+            print(f"[筛选诊断] Q值差分布 → μ={q_diff.mean():.3f}, σ={q_diff.std():.3f}, 正样本比例={(q_diff > 0).float().mean():.2%}")
+        
+        return actions == 1
 
-        is_reliable = (action == 1)
-        # 筛选结果统计（可选开启，便于监控）
-        # high_entropy_ratio, consistency_miou = state.cpu().numpy()
-        # print(f"[筛选监控] 高熵占比: {high_entropy_ratio:.3f}, 一致性mIOU: {consistency_miou:.3f}, 动作: {action}")
-        return is_reliable
+    def select_reliable(self, pseudo_logits: np.ndarray, checkpoint1_pred: np.ndarray, 
+                       checkpoint2_pred: np.ndarray) -> bool:
+        """单样本筛选接口：兼容原有调用逻辑"""
+        return self.select_reliable_batch([pseudo_logits], [checkpoint1_pred], [checkpoint2_pred])[0]
 
-    # 保留参数保存/加载功能，确保断点续训兼容性
     def get_dqn_state_dict(self):
         if not self.frozen:
-            print("WARNING: DQN未冻结，当前参数可能未稳定")
+            print("WARNING: DQN未冻结，保存需谨慎！")
         return self.dqn.state_dict()
 
     def load_dqn_state_dict(self, state_dict):
@@ -250,4 +357,4 @@ class PseudoLabelSelector:
         self.frozen = True
         for param in self.dqn.parameters():
             param.requires_grad = False
-        print("INFO: DQN参数加载完成并冻结")
+        print("INFO: DQN模型参数加载完成并冻结")
